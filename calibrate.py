@@ -18,9 +18,37 @@ import cv2
 from cv2 import resize
 import depthai as dai
 import numpy as np
-import copy
+import numba as nb
 
+import copy
 import depthai_calibration.calibration_utils as calibUtils
+
+
+@nb.njit(nb.uint16[::1] (nb.uint8[::1], nb.uint16[::1], nb.boolean), parallel=True, cache=True)
+def unpack_raw10(input, out, expand16bit):
+    lShift = 6 if expand16bit else 0
+
+   #for i in np.arange(input.size // 5): # around 25ms per frame (with numba)
+    for i in nb.prange(input.size // 5): # around  5ms per frame
+        b4 = input[i * 5 + 4]
+        out[i * 4]     = ((input[i * 5]     << 2) | ( b4       & 0x3)) << lShift
+        out[i * 4 + 1] = ((input[i * 5 + 1] << 2) | ((b4 >> 2) & 0x3)) << lShift
+        out[i * 4 + 2] = ((input[i * 5 + 2] << 2) | ((b4 >> 4) & 0x3)) << lShift
+        out[i * 4 + 3] = ((input[i * 5 + 3] << 2) |  (b4 >> 6)       ) << lShift
+
+    return out
+
+def get_image(msg):
+    width = msg.getWidth()
+    height = msg.getHeight()
+    shape = (height, width)
+
+    rgbData = msg.getData()
+    unpackedRgb = np.empty(rgbData.size * 4 // 5, dtype=np.uint16)
+    unpack_raw10(rgbData, unpackedRgb, True)
+    unpackedRgb = unpackedRgb.reshape(shape).astype(np.uint16)
+    color_frame = cv2.cvtColor(unpackedRgb, cv2.COLOR_BayerGB2BGR)
+    return color_frame
 
 font = cv2.FONT_HERSHEY_SIMPLEX
 red = (255, 0, 0)
@@ -557,7 +585,7 @@ class Main:
                     cam_node.setFps(fps)
 
                     xout.setStreamName(cam_info['name'])
-                    cam_node.isp.link(xout.input)
+                    cam_node.raw.link(xout.input)
                     if cam_info['sensorName'] == "OV9*82":
                         cam_node.initialControl.setSharpness(0)
                         cam_node.initialControl.setLumaDenoise(0)
@@ -581,7 +609,13 @@ class Main:
 
 
     def parse_frame(self, frame, stream_name):
-        if not self.is_markers_found(frame):
+        if frame.dtype == np.uint16:
+            scaled_frame = (frame//256).astype(np.uint8)
+        else:
+            scaled_frame = frame
+
+            
+        if not self.is_markers_found(scaled_frame):
             return False
 
         filename = calibUtils.image_filename(self.current_polygon, self.images_captured)
@@ -727,16 +761,15 @@ class Main:
                 if frameMsg.getType() in [dai.RawImgFrame.Type.RAW8, dai.RawImgFrame.Type.GRAY8] :
                     color_frame = cv2.cvtColor(frameMsg.getCvFrame(), cv2.COLOR_GRAY2BGR)
                 else:
-                    color_frame = frameMsg.getCvFrame()
+                    color_frame = (get_image(frameMsg)//256).astype(np.uint8)
+
+                    # color_frame = frameMsg.getCvFrame()
                 currImageList[key] = color_frame
                 # print(gray_frame.shape)
 
             resizeHeight = 0
             resizeWidth = 0
             for name, imgFrame in currImageList.items():
-                #self.coverageImages[name]=None
-                
-                # print(f'original Shape of {name} is {imgFrame.shape}' )
                
                 currImageList[name] = cv2.resize(self.draw_markers(imgFrame),
                                                  (0, 0), 
@@ -759,8 +792,8 @@ class Main:
                 #     resizeWidth = width
                 # if height > resizeHeight:
                 #     resizeHeight = height
-            
-            # print(f'Scale Shape  is {resizeWidth}x{resizeHeight}' )
+
+                # print(f'Scale Shape  is {resizeWidth}x{resizeHeight}' )
                 if self.args.invert_v and self.args.invert_h:
                     currImageList[name] = cv2.flip(currImageList[name], -1)
                 elif self.args.invert_v:
@@ -908,18 +941,29 @@ class Main:
                 for name, frameMsg in syncedMsgs.items():
                     print(f"Time stamp of {name} is {frameMsg.getTimestamp()}")
                     if self.coverageImages[name] is None:
-                        coverageShape = frameMsg.getCvFrame().shape
+                        width = frameMsg.getWidth()
+                        height = frameMsg.getHeight()
+                        coverageShape = (height, width)
                         self.coverageImages[name] = np.ones(coverageShape, np.uint8) * 255
-
-                    tried[name] = self.parse_frame(frameMsg.getCvFrame(), name)
+                    
+                    color_frame = get_image(frameMsg)
+                    tried[name] = self.parse_frame(color_frame, name)
                     print(f'Status of {name} is {tried[name]}')
                     allPassed = allPassed and tried[name]
+
                 if allPassed:
                     color = (int(np.random.randint(0, 255)), int(np.random.randint(0, 255)), int(np.random.randint(0, 255)))
                     for name, frameMsg in syncedMsgs.items():
-                        frameMsg_frame = frameMsg.getCvFrame()
-                        if len(frameMsg.getCvFrame().shape) != 3:
-                            frameMsg_frame = cv2.cvtColor(frameMsg.getCvFrame(), cv2.COLOR_GRAY2RGB)
+                        if frameMsg.getType() in [dai.RawImgFrame.Type.RAW8, dai.RawImgFrame.Type.GRAY8] :
+                            color_frame = cv2.cvtColor(frameMsg.getCvFrame(), cv2.COLOR_GRAY2BGR)
+                        else:
+                            # color_frame = get_image(frameMsg)
+                            color_frame = (get_image(frameMsg)//256).astype(np.uint8)
+
+                        frameMsg_frame = color_frame
+
+                        # if len(frameMsg.getCvFrame().shape) != 3:
+                        #     frameMsg_frame = cv2.cvtColor(frameMsg.getCvFrame(), cv2.COLOR_GRAY2RGB)
                         if len(self.coverageImages[name].shape) != 3:
                             self.coverageImages[name] = cv2.cvtColor(self.coverageImages[name], cv2.COLOR_GRAY2RGB)
                         self.coverageImages[name] = self.draw_corners(frameMsg_frame, self.coverageImages[name], color)
@@ -1091,7 +1135,7 @@ class Main:
                     Path(self.args.saveCalibPath).parent.mkdir(parents=True, exist_ok=True)
                     calibration_handler.eepromToJsonFile(self.args.saveCalibPath)
                 # try:
-                self.device.flashCalibration2(calibration_handler)
+                # self.device.flashCalibration2(calibration_handler)
                 is_write_succesful = True
                 # except RuntimeError as e:
                 #     is_write_succesful = False
@@ -1099,13 +1143,13 @@ class Main:
                 #     print("Writing in except...")
                 #     is_write_succesful = self.device.flashCalibration2(calibration_handler)
 
-                if self.args.factoryCalibration:
-                    try:
-                        self.device.flashFactoryCalibration(calibration_handler)
-                        is_write_factory_sucessful = True
-                    except RuntimeError:
-                        print("flashFactoryCalibration Failed...")
-                        is_write_factory_sucessful = False
+                # if self.args.factoryCalibration:
+                #     try:
+                #         self.device.flashFactoryCalibration(calibration_handler)
+                #         is_write_factory_sucessful = True
+                #     except RuntimeError:
+                #         print("flashFactoryCalibration Failed...")
+                #         is_write_factory_sucessful = False
 
                 if is_write_succesful:
                     if not self.args.debugProcessingMode:

@@ -66,3 +66,4 @@ recordings/
 
 # PyPi token
 .pypirc
+calib_data
