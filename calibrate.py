@@ -382,7 +382,7 @@ class Main:
         self.traceLevel= self.args.traceLevel
         self.output_scale_factor = self.args.outputScaleFactor
         self.aruco_dictionary = cv2.aruco.Dictionary_get(
-            cv2.aruco.DICT_4X4_1000)
+            cv2.aruco.DICT_5X5_250)
         self.enablePolygonsDisplay = self.args.enablePolygonsDisplay
         self.board_name = None
         if not self.args.debugProcessingMode:
